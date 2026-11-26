@@ -1364,7 +1364,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
         )
 
-        def run(**backends):
+        def run(*, sm=90, is_sm120=False, **backends):
             args = SimpleNamespace(
                 tool_call_parser="inkling2",
                 reasoning_parser="inkling",
@@ -1380,6 +1380,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 mamba_full_memory_ratio=0.1,
                 mamba_radix_cache_strategy="extra_buffer",
                 disable_radix_cache=False,
+                page_size=None,
+                kv_cache_dtype="auto",
                 attention_backend=None,
                 prefill_attention_backend=None,
                 decode_attention_backend=None,
@@ -1387,18 +1389,40 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             for name, value in backends.items():
                 setattr(args, name, value)
-            with override_platform(is_cuda=True, device_sm=90, is_sm120=False):
+            with override_platform(is_cuda=True, device_sm=sm, is_sm120=is_sm120):
                 return _inkling_overrides(args, hf)
 
-        run()
+        # The unset defaults still resolve to fa4 on Hopper and SM120.
+        self.assertEqual(run()["attention_backend"], "fa4")
+        self.assertEqual(run(sm=120, is_sm120=True)["attention_backend"], "fa4")
         run(attention_backend="fa4", decode_attention_backend="fa4")
+        # A split fa4 override pins the base, so the other phase does not fall
+        # back to the generic non-fa4 default.
+        self.assertEqual(
+            run(prefill_attention_backend="fa4")["attention_backend"], "fa4"
+        )
+        self.assertEqual(
+            run(decode_attention_backend="fa4")["attention_backend"], "fa4"
+        )
         for backends in (
             {"attention_backend": "triton"},
+            {"prefill_attention_backend": "triton"},
             {"decode_attention_backend": "triton"},
             {"prefill_attention_backend": "fa4", "decode_attention_backend": "triton"},
         ):
             with self.assertRaisesRegex(ValueError, "Inkling2 requires FA4 attention"):
                 run(**backends)
+
+        # A bare launch on a platform without FA4 is rejected instead of silently
+        # defaulting to triton and failing in the first forward.
+        with self.assertRaisesRegex(ValueError, "unavailable on this platform"):
+            run(sm=80)
+
+        # Encoder-only (EPD) builds no LLM attention; triton stays valid there.
+        self.assertNotIn(
+            "attention_backend", run(encoder_only=True, attention_backend="triton")
+        )
+        self.assertEqual(run(encoder_only=True, sm=80)["attention_backend"], "triton")
 
     def test_mimo_v2_declarations(self):
         # Callable-level golden: MiMoV2 archs are hybrid (config-shape heavy),

@@ -56,21 +56,31 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
     if inkling2:
         # Inkling2 attention runs only on FA4 (inkling2_attn.py asserts it). Reject
         # other backends here: otherwise prefill CUDA-graph capture or the first
-        # forward fails with an unrelated error.
-        non_fa4 = [
-            f"--{name.replace('_', '-')} {value}"
-            for name in (
-                "attention_backend",
-                "prefill_attention_backend",
-                "decode_attention_backend",
-            )
-            if (value := getattr(cfg, name, None)) is not None and value != "fa4"
-        ]
-        if non_fa4:
-            raise ValueError(
-                f"Inkling2 requires FA4 attention, got {', '.join(non_fa4)}. "
-                "Use fa4 or leave the attention backends unset."
-            )
+        # forward fails with an unrelated error. Encoder-only (EPD) servers build
+        # only the vision tower and never run this attention, so they stay usable.
+        if not cfg.encoder_only:
+            non_fa4 = [
+                f"--{name.replace('_', '-')} {value}"
+                for name in (
+                    "attention_backend",
+                    "prefill_attention_backend",
+                    "decode_attention_backend",
+                )
+                if (value := getattr(cfg, name, None)) is not None and value != "fa4"
+            ]
+            if non_fa4:
+                raise ValueError(
+                    f"Inkling2 requires FA4 attention, got {', '.join(non_fa4)}. "
+                    "Use fa4 or leave the attention backends unset."
+                )
+            if cfg.attention_backend is None and (
+                cfg.prefill_attention_backend == "fa4"
+                or cfg.decode_attention_backend == "fa4"
+            ):
+                # A split fa4 override covers only its phase. The other phase and
+                # the base would otherwise fall back to the generic default (fa3
+                # on Hopper, trtllm_mha on SM100), which Inkling2 cannot run.
+                overrides["attention_backend"] = "fa4"
         if cfg.tool_call_parser is None:
             overrides["tool_call_parser"] = "inkling2"
         if cfg.reasoning_parser is None:
@@ -164,6 +174,15 @@ def _inkling_overrides(server_args: Any, hf_config: Any) -> dict:
             or (inkling2 and get_platform().is_sm120)
         ):
             inkling_attn_backend = "fa4"
+        elif inkling2 and not cfg.encoder_only:
+            # A bare Inkling2 launch would otherwise pick triton here and hit the
+            # model's FA4 assert on the first forward. Encoder-only servers build
+            # no LLM, so triton remains valid for the vision tower.
+            raise ValueError(
+                "Inkling2 requires FA4 attention, which is unavailable on this "
+                "platform. Use a Hopper or Blackwell GPU, or run with "
+                "--encoder-only."
+            )
         else:
             inkling_attn_backend = "triton"
         overrides["attention_backend"] = inkling_attn_backend
