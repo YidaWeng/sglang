@@ -88,14 +88,18 @@ def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
                 f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
             )
         if not warned and now >= warn_deadline:
-            logger.warning(
-                "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
-                "continuing to wait up to %.1fs total. pids=%s",
-                len(alive),
-                warn_at,
-                wait_timeout,
-                [p.pid for p in alive],
+            warning = (
+                f"kill_process_tree: {len(alive)} process(es) still alive after "
+                f"{warn_at:.1f}s SIGKILL; continuing to wait up to "
+                f"{wait_timeout:.1f}s total. pids={[p.pid for p in alive]}"
             )
+            try:
+                logger.warning(warning)
+            except RuntimeError:
+                # kill_process_tree also runs from SIGQUIT handlers. If the main
+                # thread was mid-write on stderr, logging raises the reentrant
+                # error; report the wait without re-entering the buffer.
+                write_stderr_signal_safe(warning)
             warned = True
         time.sleep(0.1)
 
@@ -107,9 +111,17 @@ def write_stderr_signal_safe(msg: str) -> None:
     that thread is inside ``sys.stderr``'s buffered write. Logging from the
     handler then raises ``RuntimeError: reentrant call inside
     <_io.BufferedWriter name='<stderr>'>`` and replaces the error being reported.
+
+    ``os.write`` may write fewer bytes than requested; keep writing until the
+    line is out. Failures are ignored: a crash handler must not raise.
     """
+    data = f"{msg}\n".encode(errors="replace")
     try:
-        os.write(2, f"{msg}\n".encode(errors="replace"))
+        while data:
+            written = os.write(2, data)
+            if written <= 0:
+                return
+            data = data[written:]
     except OSError:
         pass
 
@@ -130,14 +142,16 @@ def kill_process_tree(
     calls `sys.exit(0)` and cannot wait for itself -- use
     `include_parent=False` if child reap must finish first.
     """
+    call_msg = (
+        f"kill_process_tree called: parent_pid={parent_pid}, "
+        f"include_parent={include_parent}, pid={os.getpid()}"
+    )
     try:
-        logger.info(
-            f"kill_process_tree called: parent_pid={parent_pid}, "
-            f"include_parent={include_parent}, pid={os.getpid()}"
-        )
+        logger.info(call_msg)
     except RuntimeError:
-        # Called from a signal handler while stderr was mid-write; still kill.
-        pass
+        # Called from a signal handler while stderr was mid-write; still kill,
+        # but keep the diagnostic without re-entering the buffer.
+        write_stderr_signal_safe(call_msg)
 
     if parent_pid is None:
         parent_pid = os.getpid()

@@ -4693,12 +4693,19 @@ class SignalHandler:
         write_stderr_signal_safe(
             f"SIGQUIT received. {signum=}, {frame=}. It usually means one child failed."
         )
-        # Stop subprocess watchdog before killing processes to prevent false-positive
-        # crash detection during normal shutdown
-        if self.tokenizer_manager._subprocess_watchdog is not None:
-            self.tokenizer_manager._subprocess_watchdog.stop()
-        self.tokenizer_manager.dump_requests_before_crash()
-        kill_process_tree(os.getpid())
+        try:
+            # Stop subprocess watchdog before killing processes to prevent
+            # false-positive crash detection during normal shutdown
+            if self.tokenizer_manager._subprocess_watchdog is not None:
+                self.tokenizer_manager._subprocess_watchdog.stop()
+            self.tokenizer_manager.dump_requests_before_crash()
+        except Exception as exc:
+            # Crash dumping still logs through the normal logger. If that
+            # re-enters stderr, report it here but never skip the process-tree
+            # kill below.
+            write_stderr_signal_safe(f"SIGQUIT cleanup failed: {exc!r}")
+        finally:
+            kill_process_tree(os.getpid())
 
 
 # Note: request abort handling logic
